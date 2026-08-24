@@ -5905,6 +5905,17 @@ def is_xinfeng_provider(provider):
     return "xinfeng.best" in base_url or provider_id in ("xinfeng", "custom-api-5")
 
 
+def is_dfyue_provider(provider):
+    # 德州玥/dfyue 视频：非 OpenAI 标准协议。
+    # 提交 POST /tasks（multipart form-data：model/prompt/ratio/duration/images），
+    # 查询 GET /tasks/{task_id}（status: pending→processing→success/failed），
+    # 下载 GET /videos/{task_id}/content（直接返回视频字节）。
+    # 参考图用 images 字段（file[]，最多 9 张，单张 ≤10MB）。
+    base_url = str((provider or {}).get("base_url") or "").lower()
+    provider_id = str((provider or {}).get("id") or "").strip().lower()
+    return "156.238.244.188" in base_url or "dfyue" in base_url or provider_id in ("dfyue", "custom-api-6")
+
+
 def is_lingchuang_provider(provider):
     # 灵创AI（lingchuangai.top）视频接口是 OpenAI 兼容风格，但端点为单数
     # /v1/video/generations（而非通用 OpenAI 的复数 /v1/videos/generations），
@@ -15658,6 +15669,98 @@ async def generate_tudou_grok_video(client, payload, provider, base_url, request
         raise HTTPException(status_code=502, detail=f"土豆 Grok 视频没有返回视频地址：{str(result)[:400]}")
     return {"videos": videos, "task_id": task_id, "raw": result}
 
+async def dfyue_video_ratio(aspect_ratio="", size=""):
+    ratio = str(aspect_ratio or size or "").strip()
+    allowed = {"1:1", "3:4", "4:3", "9:16", "16:9", "21:9"}
+    if ratio in allowed:
+        return ratio
+    if ratio.startswith("16:9") or ratio == "16/9":
+        return "16:9"
+    if ratio.startswith("9:16") or ratio == "9/16":
+        return "9:16"
+    return "9:16"  # dfyue 默认 9:16
+
+async def dfyue_video_duration(duration):
+    try:
+        value = int(duration)
+    except Exception:
+        value = 5
+    return value if value in (5, 10, 15) else (5 if value <= 5 else (10 if value <= 10 else 15))
+
+async def generate_dfyue_video(client, payload, provider, base_url, requested_model):
+    """德州玥/dfyue 视频：POST /tasks multipart → 轮询 GET /tasks/{id} → 下载 GET /videos/{id}/content。
+    注意：这是非 OpenAI 标准协议（任务流），不是 /v1/videos。
+    参考图 images 字段最多 9 张、单张 ≤10MB；认证走标准 Bearer。"""
+    model = selected_model(requested_model, "dfyue-video")
+    ratio = await dfyue_video_ratio(payload.aspect_ratio or payload.size)
+    duration = await dfyue_video_duration(payload.duration)
+    parts = [
+        ("model", (None, model)),
+        ("prompt", (None, str(payload.prompt or ""))),
+        ("ratio", (None, ratio)),
+        ("duration", (None, str(duration))),
+    ]
+    if payload.images:
+        attached = 0
+        for ref in (payload.images or [])[:9]:
+            ref_url = str(getattr(ref, "url", "") or "").strip()
+            if not ref_url:
+                continue
+            ref_file = await yuli_fetch_reference_bytes(client, ref_url)
+            if ref_file:
+                parts.append(("images", ref_file))
+                attached += 1
+        if payload.images and not attached:
+            raise HTTPException(status_code=400, detail="dfyue 图生视频没有成功读取参考图。请使用本地图片、公网图片 URL 或 data:image;base64。")
+    response = await client.post(
+        f"{base_url}/tasks",
+        headers=api_headers(json_body=False, provider=provider, model=model),
+        files=parts,  # POST /tasks 是 multipart form-data：普通字段与图片都以 (name, (filename, value, type)) 形式提交
+    )
+    response.raise_for_status()
+    try:
+        raw = response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"dfyue 视频接口返回非 JSON 响应：{(response.text or '')[:500]}") from exc
+    task_id = str(raw.get("task_id") or raw.get("id") or extract_task_id(raw) or "").strip()
+    if not task_id:
+        raise HTTPException(status_code=502, detail=f"dfyue 视频提交未返回任务 ID：{str(raw)[:400]}")
+    # 轮询任务状态：pending → processing → success/failed
+    last_status = ""
+    while True:
+        await asyncio.sleep(VIDEO_POLL_INTERVAL)
+        try:
+            status_resp = await client.get(
+                f"{base_url}/tasks/{task_id}",
+                headers=api_headers(provider=provider, model=model),
+            )
+            status_resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # 任务还没建好或 404 时继续等，避免误判失败
+            if exc.response.status_code in (404, 409):
+                continue
+            raise
+        status_data = status_resp.json()
+        status = str(status_data.get("status") or "").strip().lower()
+        if status != last_status:
+            print(f"[VIDEO-POLL] dfyue task={task_id} status={status}", flush=True)
+            last_status = status
+        if status in ("success", "succeeded", "completed", "complete", "done", "finish", "finished", "3"):
+            break
+        if status in ("failed", "fail", "error", "cancel", "canceled", "cancelled", "4"):
+            raise HTTPException(status_code=502, detail=f"dfyue 视频任务失败：{status_data.get('message') or status_data.get('error') or str(status_data)[:300]}")
+    # 下载视频：GET /videos/{task_id}/content → 视频字节
+    try:
+        content_resp = await client.get(
+            f"{base_url}/videos/{task_id}/content",
+            headers=api_headers(provider=provider, model=model),
+        )
+        content_resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"dfyue 视频下载失败：{exc}") from exc
+    local_url = await save_video_bytes_to_output(content_resp.content, prefix="dfyue_video_")
+    return {"videos": [local_url], "task_id": task_id, "raw": status_data}
+
 def volcengine_video_prompt_text(prompt, aspect_ratio="", duration=None):
     text = str(prompt or "").strip()
     suffixes = []
@@ -15722,10 +15825,21 @@ async def canvas_video(payload: CanvasVideoRequest):
     is_lingjing = is_lingjing_provider(provider)
     is_agnes = is_agnes_provider(provider, payload.model)
     is_xinfeng = is_xinfeng_provider(provider)
+    is_dfyue = is_dfyue_provider(provider)
     volc_is_proxy = bool(is_volcengine and urllib.parse.urlparse(base_url).path.rstrip("/"))
     submit_urls = video_submit_url_candidates(provider, base_url)
     submit_url = submit_urls[0]
     requested_model = selected_model(payload.model, "agnes-video-v2.0" if is_agnes else "veo3-fast")
+    if is_dfyue:
+        try:
+            async with httpx.AsyncClient(timeout=VIDEO_POLL_TIMEOUT) as dfyue_client:
+                return await generate_dfyue_video(dfyue_client, payload, provider, base_url, requested_model)
+        except httpx.HTTPStatusError as exc:
+            text = exc.response.text
+            raise HTTPException(status_code=exc.response.status_code, detail=f"dfyue 视频接口错误：{text}") from exc
+        except httpx.HTTPError as exc:
+            log_net_error(f"视频(dfyue) 网络/TLS错误 model={requested_model}", exc)
+            raise HTTPException(status_code=502, detail=f"请求 dfyue 视频接口失败：{exc}") from exc
     if is_tudou_provider(provider) and is_tudou_video_model(requested_model):
         try:
             async with httpx.AsyncClient(timeout=VIDEO_POLL_TIMEOUT) as tudou_client:
